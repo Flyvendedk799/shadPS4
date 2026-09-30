@@ -48,8 +48,38 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
 
     scheduler.SetSubmitCallback([this](Vulkan::SubmitInfo& info) {
         runtime.FlushBarriers();
-        buffer_cache.SubmitPendingArenaBinds(info);
+        if (auto batch = buffer_cache.TakePendingArenaBinds(info)) {
+            const vk::Queue queue = instance.GetGraphicsQueue();
+            scheduler.SetPreSubmit([batch = std::move(*batch), queue]() mutable {
+                std::vector<vk::SparseBufferMemoryBindInfo> buffer_binds;
+                buffer_binds.reserve(batch.buffers.size());
+                for (const auto& binds : batch.buffers) {
+                    buffer_binds.emplace_back(vk::SparseBufferMemoryBindInfo{
+                        .buffer = binds.buffer,
+                        .bindCount = static_cast<u32>(binds.binds.size()),
+                        .pBinds = binds.binds.data(),
+                    });
+                }
+                const u64 signal_tick = batch.signal_tick;
+                const vk::Semaphore signal = batch.signal;
+                const vk::TimelineSemaphoreSubmitInfo timeline_si = {
+                    .signalSemaphoreValueCount = 1u,
+                    .pSignalSemaphoreValues = &signal_tick,
+                };
+                const vk::BindSparseInfo sparse_info = {
+                    .pNext = &timeline_si,
+                    .bufferBindCount = static_cast<u32>(buffer_binds.size()),
+                    .pBufferBinds = buffer_binds.data(),
+                    .signalSemaphoreCount = 1u,
+                    .pSignalSemaphores = &signal,
+                };
+                const auto submit_result = queue.bindSparse(sparse_info);
+                ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost,
+                           "Device lost during sparse bind");
+            });
+        }
     });
+    scheduler.SetUploadFlushCallback([this] { buffer_cache.FlushPendingUploads(); });
 }
 
 Rasterizer::~Rasterizer() = default;
@@ -398,6 +428,10 @@ void Rasterizer::OnSubmit() {
 
 void Rasterizer::OnFence() {
     texture_cache.ProcessDownloadImages();
+}
+
+bool Rasterizer::DeferDownloads(Common::UniqueFunction<void>& after) {
+    return texture_cache.DeferDownloads(after);
 }
 
 bool Rasterizer::BindResources(const Pipeline* pipeline) {

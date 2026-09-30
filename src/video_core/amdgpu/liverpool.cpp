@@ -674,15 +674,37 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             }
             case PM4ItOpcode::EventWriteEop: {
                 const auto* event_eop = reinterpret_cast<const PM4CmdEventWriteEop*>(header);
+                struct EopSignal {
+                    bool write{};
+                    void* address{};
+                    u64 data{};
+                    u32 size{};
+                    bool irq{};
+                } signal;
+                event_eop->SignalFence(
+                    [&](void* address, u64 data, u32 num_bytes) {
+                        signal.write = true;
+                        signal.address = address;
+                        signal.data = data;
+                        signal.size = num_bytes;
+                    },
+                    [&] { signal.irq = true; });
+                Common::UniqueFunction<void> replay{[signal] {
+                    if (signal.write) {
+                        auto* memory = Core::Memory::Instance();
+                        ASSERT(memory->TryWriteBacking(signal.address, &signal.data, signal.size));
+                    }
+                    if (signal.irq) {
+                        Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxEop);
+                    }
+                }};
+                if (rasterizer && rasterizer->DeferDownloads(replay)) {
+                    break;
+                }
                 if (rasterizer) {
                     rasterizer->OnFence();
                 }
-                event_eop->SignalFence(
-                    [](void* address, u64 data, u32 num_bytes) {
-                        auto* memory = Core::Memory::Instance();
-                        ASSERT(memory->TryWriteBacking(address, &data, num_bytes));
-                    },
-                    [] { Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxEop); });
+                replay();
                 break;
             }
             case PM4ItOpcode::DmaData: {

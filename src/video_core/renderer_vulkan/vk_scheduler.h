@@ -7,6 +7,7 @@
 #include <mutex>
 #include <thread>
 #include <queue>
+#include <vector>
 
 #include "common/interval_set.h"
 #include "common/unique_function.h"
@@ -369,6 +370,11 @@ public:
     /// Waits for the given tick to trigger on the GPU.
     void Wait(u64 tick);
 
+    /// Waits for a tick that was already submitted. Does not flush.
+    void WaitSubmitted(u64 tick) {
+        work_semaphore.Wait(tick);
+    }
+
     /// Attempts to execute operations whose tick the GPU has caught up with.
     void PopPendingOperations();
 
@@ -428,6 +434,40 @@ public:
         return &work_semaphore;
     }
 
+    /// Runs a graphics-queue operation on the dedicated Vulkan queue thread.
+    /// Operations from every scheduler are executed in enqueue order.
+    /// When wait is set, returns after the operation has been submitted to the driver.
+    void QueueOperation(Common::UniqueFunction<void()> job, bool wait);
+
+    /// Queue operation that runs immediately before the next graphics submit on the queue thread.
+    void SetPreSubmit(Common::UniqueFunction<void()> job) {
+        pre_submit = std::move(job);
+    }
+
+    /// Called before a render pass begins or ends so pending buffer uploads land in this
+    /// command buffer, ahead of the draw that consumes them.
+    void SetUploadFlushCallback(SessionFunc&& callback) {
+        on_upload_flush = std::move(callback);
+    }
+
+    /// Skips the upload flush while a GPU-to-CPU copy is recorded, so CPU data is not written
+    /// over the bytes about to be read back.
+    void SuspendUploadFlush() noexcept {
+        ++suspend_upload_flush;
+    }
+    void ResumeUploadFlush() noexcept {
+        --suspend_upload_flush;
+    }
+
+    /// Runs on the priority thread once the given timeline value is signaled.
+    void DeferAfter(u64 tick, Common::UniqueFunction<void> func) {
+        {
+            std::unique_lock lk(priority_pending_ops_mutex);
+            priority_pending_ops.emplace(std::move(func), tick);
+        }
+        priority_pending_ops_cv.notify_one();
+    }
+
     /// Defers an operation until the gpu has reached the current cpu tick.
     /// Will be run when submitting or calling PopPendingOperations.
     void DeferOperation(Common::UniqueFunction<void>&& func) {
@@ -452,6 +492,8 @@ private:
 
     void SubmitExecution(SubmitInfo& info);
 
+    void ExecuteSubmit(SubmitInfo info, std::vector<vk::CommandBuffer> cmd_buffers);
+
     void PriorityPendingOpsThread(std::stop_token stoken);
 
 private:
@@ -459,8 +501,14 @@ private:
     Semaphore work_semaphore;
     CommandPool command_pool;
     DynamicState dynamic_state;
+    void FlushQueuedUploads();
+
     SessionFunc on_session{};
     SubmitFunc on_submit{};
+    SessionFunc on_upload_flush{};
+    Common::UniqueFunction<void()> pre_submit{};
+    bool in_upload_flush{};
+    int suspend_upload_flush{};
     struct Session {
         vk::CommandBuffer upload{};
         vk::CommandBuffer primary{};

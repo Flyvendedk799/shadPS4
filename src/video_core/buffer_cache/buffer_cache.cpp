@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <cstring>
+#include <vector>
 #include <magic_enum/magic_enum.hpp>
 
 #include "common/alignment.h"
@@ -102,69 +104,185 @@ void BufferCache::InvalidateMemory(VAddr device_addr, u64 size, bool assume_lock
 }
 
 void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool assume_locks) {
-    const auto flush_request = [this, device_addr, size, is_write] {
-        const u32 first_block = device_addr >> block_shift;
-        const u32 last_block = (device_addr + size - 1) >> block_shift;
-        const auto* arena = GetArena(first_block, last_block);
-
-        // GPU-modified ranges come as many small scattered islands,
-        // so the download is widened to a window around the request
-        constexpr u64 WindowSize = 512_KB;
-        const VAddr arena_end = arena->cpu_addr + arena->size_bytes;
-        const VAddr window_start =
-            std::max<VAddr>(Common::AlignDown(device_addr, WindowSize), arena->cpu_addr);
-        const VAddr window_end = std::min<VAddr>(
-            std::max<VAddr>(window_start + WindowSize, device_addr + size), arena_end);
-        DownloadMemory(arena, window_start, window_end - window_start);
+    // The GPU thread only records the copy and submits it. The faulting thread waits, so command
+    // processing continues while the GPU finishes the readback.
+    auto finish = [this, device_addr, size, is_write](ReadbackTicket ticket) {
+        if (ticket.valid) {
+            FinishReadback(std::move(ticket));
+        }
         if (is_write) {
             memory_tracker->MarkRegionAsCpuModified(device_addr, size);
         }
     };
     if (assume_locks) {
-        flush_request();
-    } else {
-        liverpool->SendCommand<true>(std::move(flush_request));
-    }
-}
-
-void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size) {
-    boost::container::small_vector<vk::BufferCopy, 1> copies;
-    u64 total_size_bytes = 0;
-    const VAddr arena_base = arena->cpu_addr;
-    memory_tracker->ForEachDownloadRange<false>(device_addr, size, [&](u64 address, u64 size) {
-        const auto add_download = [&](VAddr start, VAddr end) {
-            const u64 new_offset = start - arena_base;
-            const u64 new_size = end - start;
-            copies.push_back(vk::BufferCopy{
-                .srcOffset = new_offset,
-                .dstOffset = total_size_bytes,
-                .size = new_size,
-            });
-            // Align up to avoid cache conflicts
-            constexpr u64 align = 64ULL;
-            constexpr u64 mask = ~(align - 1ULL);
-            total_size_bytes += (new_size + align - 1) & mask;
-        };
-        gpu_modified_ranges.ForEachInRange(address, size, add_download);
-        gpu_modified_ranges.Subtract(address, size);
-    });
-    if (total_size_bytes == 0) {
+        auto ticket = RecordReadback(device_addr, size);
+        if (ticket.valid) {
+            ticket.tick = scheduler.CurrentTick();
+            scheduler.Flush();
+            scheduler.Wait(ticket.tick);
+        }
+        finish(std::move(ticket));
         return;
     }
-    const auto download = staging_pool.Request(total_size_bytes, VideoCore::MemoryType::HostCached);
-    for (auto& copy : copies) {
-        copy.dstOffset += download.offset;
-    }
-    runtime.CopyBuffer(arena, download.buffer, copies);
-    scheduler.Finish();
 
-    download.buffer->Invalidate(download.offset, download.size);
-    for (const auto& copy : copies) {
-        auto* dst_addr = std::bit_cast<u8*>(arena_base + copy.srcOffset);
-        memory->TryWriteBacking(dst_addr, download.mapped + (copy.dstOffset - download.offset),
-                                copy.size);
+    ReadbackTicket ticket;
+    liverpool->SendCommand<true>([&] {
+        ticket = RecordReadback(device_addr, size);
+        if (ticket.valid) {
+            ticket.tick = scheduler.CurrentTick();
+            scheduler.Flush();
+        } else if (is_write) {
+            memory_tracker->MarkRegionAsCpuModified(device_addr, size);
+        }
+    });
+    if (!ticket.valid) {
+        return;
     }
-    memory_tracker->UnmarkRegionAsGpuModified(device_addr, size, false);
+    scheduler.WaitSubmitted(ticket.tick);
+    liverpool->SendCommand<true>([&] { finish(std::move(ticket)); });
+}
+
+BufferCache::ReadbackTicket BufferCache::RecordReadback(VAddr device_addr, u64 size) {
+    // One GPU wait for the fault window and every other dirty range that fits the budget.
+    // The copied bytes match a precise readback; later GPU writes re-arm read tracking.
+    constexpr u64 WindowSize = 512_KB;
+    constexpr u64 CoalesceBudget = 32_MB;
+    constexpr u64 StagingAlign = 64;
+
+    const u32 first_block = device_addr >> block_shift;
+    const u32 last_block = (device_addr + size - 1) >> block_shift;
+    const auto* fault_arena = GetArena(first_block, last_block);
+    const VAddr arena_end = fault_arena->cpu_addr + fault_arena->size_bytes;
+    const VAddr window_start =
+        std::max<VAddr>(Common::AlignDown(device_addr, WindowSize), fault_arena->cpu_addr);
+    const VAddr window_end = std::min<VAddr>(
+        std::max<VAddr>(window_start + WindowSize, device_addr + size), arena_end);
+
+    struct Window {
+        VAddr addr;
+        u64 size;
+    };
+    std::vector<Window> windows;
+    windows.push_back({window_start, window_end - window_start});
+    u64 budget = window_end - window_start;
+
+    std::vector<std::pair<VAddr, VAddr>> modified;
+    gpu_modified_ranges.ForEach([&](VAddr begin, VAddr end) { modified.emplace_back(begin, end); });
+    const auto add_window = [&](VAddr begin, VAddr end) {
+        if (begin >= end || budget >= CoalesceBudget) {
+            return;
+        }
+        u64 span = end - begin;
+        if (budget + span > CoalesceBudget) {
+            span = CoalesceBudget - budget;
+        }
+        windows.push_back({begin, span});
+        budget += span;
+    };
+    for (const auto [begin, end] : modified) {
+        if (budget >= CoalesceBudget) {
+            break;
+        }
+        if (begin < window_end && end > window_start) {
+            if (begin < window_start) {
+                add_window(begin, window_start);
+            }
+            if (end > window_end) {
+                add_window(window_end, end);
+            }
+        } else {
+            add_window(begin, end);
+        }
+    }
+
+    struct Piece {
+        const Buffer* arena;
+        VAddr src;
+        u64 size;
+        u64 pack_off;
+    };
+    RangeSet covered;
+    std::vector<Piece> pieces;
+    u64 total_size_bytes = 0;
+    const auto add_piece = [&](const Buffer* arena, VAddr src, u64 piece_size) {
+        if (piece_size == 0) {
+            return;
+        }
+        pieces.push_back({arena, src, piece_size, total_size_bytes});
+        total_size_bytes += (piece_size + StagingAlign - 1) & ~(StagingAlign - 1);
+    };
+
+    for (const Window& window : windows) {
+        VAddr addr = window.addr;
+        u64 remaining = window.size;
+        while (remaining > 0) {
+            const u64 page_off = addr & (ARENA_PAGE_SIZE - 1);
+            const u64 slice = std::min(remaining, ARENA_PAGE_SIZE - page_off);
+            const u64 slice_first = addr >> block_shift;
+            const u64 slice_last = (addr + slice - 1) >> block_shift;
+            const Buffer* arena = GetArena(slice_first, slice_last);
+            memory_tracker->ForEachDownloadRange<false>(addr, slice, [&](u64 address, u64 range_size) {
+                gpu_modified_ranges.ForEachInRange(
+                    address, range_size, [&](VAddr start, VAddr end) {
+                        boost::container::small_vector<std::pair<VAddr, u64>, 4> gaps;
+                        covered.ForEachNotInRange(start, end - start, [&](VAddr gap, u64 gap_size) {
+                            gaps.emplace_back(gap, gap_size);
+                        });
+                        for (const auto [gap, gap_size] : gaps) {
+                            add_piece(arena, gap, gap_size);
+                            covered.Add(gap, gap_size);
+                        }
+                    });
+            });
+            addr += slice;
+            remaining -= slice;
+        }
+    }
+
+    if (pieces.empty()) {
+        return {};
+    }
+
+    ReadbackTicket ticket;
+    ticket.valid = true;
+    ticket.window = window_start;
+    ticket.window_size = window_end - window_start;
+    ticket.writes.reserve(pieces.size());
+    ticket.download =
+        staging_pool.Request(total_size_bytes, MemoryType::HostCached, StagingAlign, true);
+
+    scheduler.SuspendUploadFlush();
+    for (size_t index = 0; index < pieces.size();) {
+        const Buffer* arena = pieces[index].arena;
+        boost::container::small_vector<vk::BufferCopy, 8> copies;
+        for (; index < pieces.size() && pieces[index].arena == arena; ++index) {
+            const Piece& piece = pieces[index];
+            copies.push_back(vk::BufferCopy{
+                .srcOffset = piece.src - arena->cpu_addr,
+                .dstOffset = ticket.download.offset + piece.pack_off,
+                .size = piece.size,
+            });
+            ticket.writes.push_back({piece.src, piece.pack_off, piece.size});
+        }
+        runtime.CopyBuffer(arena, ticket.download.buffer, copies);
+    }
+    scheduler.ResumeUploadFlush();
+    return ticket;
+}
+
+void BufferCache::FinishReadback(ReadbackTicket ticket) {
+    if (!ticket.valid) {
+        return;
+    }
+    ticket.download.Invalidate();
+    for (const auto& write : ticket.writes) {
+        memory->TryWriteBacking(std::bit_cast<u8*>(write.dst),
+                                ticket.download.mapped + write.pack_off, write.size);
+        memory_tracker->UnmarkRegionAsGpuModified(write.dst, write.size, false);
+        gpu_modified_ranges.Subtract(write.dst, write.size);
+    }
+    memory_tracker->UnmarkRegionAsGpuModified(ticket.window, ticket.window_size, false);
+    staging_pool.FreeDeferred(ticket.download);
 }
 
 std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 size,
@@ -180,9 +298,10 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
     const u64 last_block = (device_addr + size - 1) >> block_shift;
     const auto* arena = GetArena(first_block, last_block);
     EnsureResident(arena, first_block, last_block);
-    SynchronizeMemory(arena, device_addr, size, is_written, is_texel_buffer);
+    QueueUpload(arena, device_addr, size, is_written);
     if (is_texel_buffer && !is_written) {
-        SynchronizeMemoryFromImage(arena, device_addr, size);
+        pending_texels.push_back({arena, device_addr, size});
+        FlushPendingUploads();
     }
     if (is_written) {
         gpu_modified_ranges.Add(device_addr, size);
@@ -210,6 +329,7 @@ bool BufferCache::IsRegionGpuModified(VAddr addr, size_t size) {
 }
 
 void BufferCache::SynchronizeDmaBuffers() {
+    FlushPendingUploads();
     fault_process_pending = true;
     for (const auto& range : resident_ranges) {
         const u64 page = range.start >> (ARENA_PAGE_BITS - block_shift);
@@ -329,6 +449,80 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
     runtime.CopyBuffer(staging.buffer, bda_pagetable_buffer.get(), copies);
 }
 
+void BufferCache::QueueUpload(const Buffer* arena, VAddr device_addr, u32 size, bool is_written) {
+    memory_tracker->ForEachUploadRange(device_addr, size, is_written, [&](u64 addr, u64 range_size) {
+        const u64 pack_off = pending_upload_bytes.size();
+        pending_upload_bytes.resize(pack_off + range_size);
+        memory->CopySparseMemory(addr, pending_upload_bytes.data() + pack_off, range_size);
+        pending_uploads.push_back(PendingUpload{
+            .arena = arena,
+            .pack_off = pack_off,
+            .dst_offset = addr - arena->cpu_addr,
+            .size = range_size,
+        });
+    });
+}
+
+void BufferCache::FlushPendingUploads() {
+    if (flushing_uploads || (pending_uploads.empty() && pending_texels.empty())) {
+        return;
+    }
+    flushing_uploads = true;
+    const auto uploads = std::move(pending_uploads);
+    const auto bytes = std::move(pending_upload_bytes);
+    const auto texels = std::move(pending_texels);
+    pending_uploads.clear();
+    pending_upload_bytes.clear();
+    pending_texels.clear();
+
+    if (!uploads.empty()) {
+        const auto staging =
+            staging_pool.Request(bytes.size(), MemoryType::HostUncached, 0, true);
+        std::memcpy(staging.mapped, bytes.data(), bytes.size());
+        staging.Flush();
+
+        std::vector<u8> emitted(uploads.size(), 0);
+        for (size_t index = 0; index < uploads.size(); ++index) {
+            if (emitted[index]) {
+                continue;
+            }
+            const Buffer* arena = uploads[index].arena;
+            boost::container::small_vector<vk::BufferCopy, 8> copies;
+            for (size_t cursor = index; cursor < uploads.size(); ++cursor) {
+                if (emitted[cursor] || uploads[cursor].arena != arena) {
+                    continue;
+                }
+                emitted[cursor] = 1;
+                const PendingUpload& upload = uploads[cursor];
+                copies.push_back(vk::BufferCopy{
+                    .srcOffset = staging.offset + upload.pack_off,
+                    .dstOffset = upload.dst_offset,
+                    .size = upload.size,
+                });
+            }
+            runtime.CopyBuffer(staging.buffer, arena, copies);
+        }
+        staging_pool.FreeDeferred(staging);
+
+        const vk::MemoryBarrier2 barrier = {
+            .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
+            .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+        };
+        const vk::DependencyInfo dependency = {
+            .memoryBarrierCount = 1,
+            .pMemoryBarriers = &barrier,
+        };
+        scheduler.CommandBuffer().pipelineBarrier2(dependency);
+    }
+
+    for (const PendingTexel& texel : texels) {
+        SynchronizeMemoryFromImage(texel.arena, texel.addr, texel.size);
+    }
+    flushing_uploads = false;
+}
+
 bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 size,
                                     bool is_written, bool is_texel_buffer) {
     boost::container::small_vector<vk::BufferCopy, 4> copies;
@@ -403,43 +597,25 @@ bool BufferCache::SynchronizeMemoryFromImage(const Buffer* arena, VAddr device_a
     return true;
 }
 
-void BufferCache::SubmitPendingArenaBinds(Vulkan::SubmitInfo& info) {
+std::optional<PendingSparseBatch> BufferCache::TakePendingArenaBinds(Vulkan::SubmitInfo& info) {
     if (pending_binds.empty()) {
-        return;
+        return std::nullopt;
     }
 
-    std::vector<vk::SparseBufferMemoryBindInfo> buffer_binds;
-    buffer_binds.reserve(pending_binds.size());
-
+    PendingSparseBatch batch;
+    batch.buffers.reserve(pending_binds.size());
     for (const auto& binds : pending_binds) {
-        buffer_binds.emplace_back(vk::SparseBufferMemoryBindInfo{
-            .buffer = binds.arena->Handle(),
-            .bindCount = static_cast<u32>(binds.binds.size()),
-            .pBinds = binds.binds.data(),
-        });
+        PendingSparseBuffer buffer;
+        buffer.buffer = binds.arena->Handle();
+        buffer.binds.assign(binds.binds.begin(), binds.binds.end());
+        batch.buffers.push_back(std::move(buffer));
     }
 
-    const u64 signal_tick = memory_semaphore.NextTick();
-    const auto signal_sema = memory_semaphore.Handle();
-
-    const vk::TimelineSemaphoreSubmitInfo timeline_si = {
-        .signalSemaphoreValueCount = 1u,
-        .pSignalSemaphoreValues = &signal_tick,
-    };
-
-    const vk::BindSparseInfo sparse_info = {
-        .pNext = &timeline_si,
-        .bufferBindCount = static_cast<u32>(buffer_binds.size()),
-        .pBufferBinds = buffer_binds.data(),
-        .signalSemaphoreCount = 1u,
-        .pSignalSemaphores = &signal_sema,
-    };
-
-    info.AddWait(signal_sema, signal_tick);
-    auto submit_result = instance.GetGraphicsQueue().bindSparse(sparse_info);
-    ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost, "Device lost during submit");
-
+    batch.signal_tick = memory_semaphore.NextTick();
+    batch.signal = memory_semaphore.Handle();
+    info.AddWait(batch.signal, batch.signal_tick);
     pending_binds.clear();
+    return batch;
 }
 
 } // namespace VideoCore

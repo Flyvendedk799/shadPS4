@@ -146,15 +146,35 @@ void MemoryManager::SetPrtArea(u32 id, VAddr address, u64 size) {
 
 void MemoryManager::CopySparseMemory(VAddr virtual_addr, u8* dest, u64 size) {
     const auto& backing_pages = impl.BackingPages();
+    constexpr u64 PageSize = 16_KB;
     while (size) {
         const u64 page = virtual_addr >> 14;
-        const u64 offset_in_page = virtual_addr % 16_KB;
-        const u64 copy_size = std::min<u64>(16_KB - offset_in_page, size);
-        if (auto* entry = backing_pages.find(page); entry && *entry) {
-            std::memcpy(dest, *entry + offset_in_page, copy_size);
-        } else {
+        const u64 offset_in_page = virtual_addr & (PageSize - 1);
+        auto* entry = backing_pages.find(page);
+        if (!entry || !*entry) {
+            const u64 copy_size = std::min<u64>(PageSize - offset_in_page, size);
             std::memset(dest, 0, copy_size);
+            size -= copy_size;
+            virtual_addr += copy_size;
+            dest += copy_size;
+            continue;
         }
+
+        const u8* src = *entry + offset_in_page;
+        u64 copy_size = std::min<u64>(PageSize - offset_in_page, size);
+        // Consecutive guest pages are one host allocation. Copy them in a single memcpy.
+        while (copy_size < size) {
+            const u64 copied_end = virtual_addr + copy_size;
+            if ((copied_end & (PageSize - 1)) != 0) {
+                break;
+            }
+            auto* next = backing_pages.find(copied_end >> 14);
+            if (!next || !*next || *next != src + copy_size) {
+                break;
+            }
+            copy_size += std::min<u64>(PageSize, size - copy_size);
+        }
+        std::memcpy(dest, src, copy_size);
         size -= copy_size;
         virtual_addr += copy_size;
         dest += copy_size;

@@ -1072,12 +1072,12 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
     info.AddSignal(frame->present_done);
     scheduler.Flush(info);
 
-    // Present to swapchain.
-    {
+    // Present on the Vulkan queue thread so it cannot jump ahead of the frame submit.
+    bool presented = false;
+    scheduler.QueueOperation([&] { presented = swapchain.Present(); }, true);
+    if (!presented) {
         std::scoped_lock submit_lock{Scheduler::submit_mutex};
-        if (!swapchain.Present()) {
-            swapchain.Recreate(window.GetWidth(), window.GetHeight());
-        }
+        swapchain.Recreate(window.GetWidth(), window.GetHeight());
     }
 
     free_frame();

@@ -4,6 +4,8 @@
 #pragma once
 
 #include <deque>
+#include <optional>
+#include <vector>
 #include <boost/container/small_vector.hpp>
 
 #include "common/interval_set.h"
@@ -12,6 +14,7 @@
 #include "video_core/buffer_cache/fault_manager.h"
 #include "video_core/buffer_cache/range_set.h"
 #include "video_core/renderer_vulkan/vk_semaphore.h"
+#include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 
 namespace AmdGpu {
 struct Liverpool;
@@ -29,6 +32,17 @@ class StagingBufferPool;
 } // namespace Vulkan
 
 namespace VideoCore {
+
+struct PendingSparseBuffer {
+    vk::Buffer buffer{};
+    std::vector<vk::SparseMemoryBind> binds;
+};
+
+struct PendingSparseBatch {
+    std::vector<PendingSparseBuffer> buffers;
+    vk::Semaphore signal{};
+    u64 signal_tick{};
+};
 
 class TextureCache;
 class MemoryTracker;
@@ -95,11 +109,16 @@ public:
     /// Return true when a region is modified from the GPU
     [[nodiscard]] bool IsRegionGpuModified(VAddr addr, size_t size);
 
+    /// Writes queued CPU uploads into the current command buffer, before the draw that uses them.
+    void FlushPendingUploads();
+
     /// Synchronizes all buffers needed for DMA.
     void SynchronizeDmaBuffers();
 
-    /// Commits pending sparse buffer memory binds. Must be called before every scheduler submit.
-    void SubmitPendingArenaBinds(Vulkan::SubmitInfo& info);
+    /// Takes pending sparse binds for the Vulkan queue thread.
+    /// The graphics submit must wait on the returned timeline signal, and bindSparse must run
+    /// before that submit on the queue thread.
+    [[nodiscard]] std::optional<PendingSparseBatch> TakePendingArenaBinds(Vulkan::SubmitInfo& info);
 
 private:
     struct ArenaBinds {
@@ -119,7 +138,25 @@ private:
 
     void EnsureResident(const Buffer* arena, u64 first_block, u64 last_block);
 
-    void DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size);
+    struct ReadbackTicket {
+        bool valid{};
+        u64 tick{};
+        Vulkan::StagingBufferRef download{};
+        struct Write {
+            VAddr dst;
+            u64 pack_off;
+            u64 size;
+        };
+        std::vector<Write> writes;
+        VAddr window{};
+        u64 window_size{};
+    };
+
+    /// Records coalesced readback copies. Does not wait for the GPU.
+    ReadbackTicket RecordReadback(VAddr device_addr, u64 size);
+
+    /// Copies a finished readback into guest memory and drops GPU tracking.
+    void FinishReadback(ReadbackTicket ticket);
 
     bool SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 size, bool is_written,
                            bool is_texel_buffer);
@@ -138,6 +175,24 @@ private:
     StreamBuffer stream_buffer;
     Buffer gds_buffer;
     RangeSet gpu_modified_ranges;
+
+    struct PendingUpload {
+        const Buffer* arena;
+        u64 pack_off;
+        u64 dst_offset;
+        u64 size;
+    };
+    struct PendingTexel {
+        const Buffer* arena;
+        VAddr addr;
+        u32 size;
+    };
+    std::vector<u8> pending_upload_bytes;
+    std::vector<PendingUpload> pending_uploads;
+    std::vector<PendingTexel> pending_texels;
+    bool flushing_uploads{};
+
+    void QueueUpload(const Buffer* arena, VAddr device_addr, u32 size, bool is_written);
 
     std::unique_ptr<FaultManager> fault_manager;
     std::unique_ptr<Buffer> bda_pagetable_buffer;

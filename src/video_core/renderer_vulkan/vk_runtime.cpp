@@ -720,15 +720,18 @@ void Runtime::AccessBuffer(const VideoCore::Buffer* handle, u64 offset, u64 size
 }
 
 void Runtime::FlushBarriers() {
+    // Copy first. Ending the pass flushes uploads, and that records new barriers.
+    const vk::MemoryBarrier2 barrier = memory_barrier;
+    const std::vector<vk::ImageMemoryBarrier2> images = image_barriers;
     vk::DependencyInfo dep_info{};
 
-    if (memory_barrier.srcStageMask) {
-        dep_info.pMemoryBarriers = &memory_barrier;
+    if (barrier.srcStageMask) {
+        dep_info.pMemoryBarriers = &barrier;
         dep_info.memoryBarrierCount = 1U;
     }
-    if (!image_barriers.empty()) {
-        dep_info.pImageMemoryBarriers = image_barriers.data();
-        dep_info.imageMemoryBarrierCount = static_cast<u32>(image_barriers.size());
+    if (!images.empty()) {
+        dep_info.pImageMemoryBarriers = images.data();
+        dep_info.imageMemoryBarrierCount = static_cast<u32>(images.size());
     }
 
     if (!dep_info.memoryBarrierCount && !dep_info.imageMemoryBarrierCount) {

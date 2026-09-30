@@ -1,6 +1,10 @@
 // SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <semaphore>
+#include <utility>
+#include <vector>
+
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/thread.h"
@@ -12,6 +16,81 @@ namespace Vulkan {
 
 std::mutex Scheduler::submit_mutex;
 
+namespace {
+
+struct QueueWorker {
+    struct Item {
+        Common::UniqueFunction<void()> job;
+        std::binary_semaphore* done{};
+    };
+
+    std::mutex life_mutex;
+    std::mutex mutex;
+    std::condition_variable_any cv;
+    std::queue<Item> jobs;
+    std::jthread thread;
+    int users = 0;
+
+    void Loop(std::stop_token stoken) {
+        Common::SetCurrentThreadName("shadPS4:VulkanQueue");
+        while (true) {
+            Item item;
+            {
+                std::unique_lock lock{mutex};
+                cv.wait(lock, stoken, [this] { return !jobs.empty(); });
+                if (jobs.empty()) {
+                    return;
+                }
+                item = std::move(jobs.front());
+                jobs.pop();
+            }
+            {
+                std::scoped_lock queue_lock{Scheduler::submit_mutex};
+                item.job();
+            }
+            if (item.done) {
+                item.done->release();
+            }
+        }
+    }
+
+    void Start() {
+        std::scoped_lock lock{life_mutex};
+        if (users++ == 0) {
+            thread = std::jthread([this](std::stop_token stoken) { Loop(stoken); });
+        }
+    }
+
+    void Stop() {
+        std::scoped_lock lock{life_mutex};
+        if (--users > 0) {
+            return;
+        }
+        thread.request_stop();
+        cv.notify_all();
+        thread.join();
+    }
+
+    void Enqueue(Common::UniqueFunction<void()> job, bool wait) {
+        std::binary_semaphore done{0};
+        {
+            std::lock_guard lock{mutex};
+            jobs.push(Item{std::move(job), wait ? &done : nullptr});
+        }
+        cv.notify_one();
+        if (wait) {
+            done.acquire();
+        }
+    }
+};
+
+QueueWorker& GetQueueWorker() {
+    static QueueWorker worker;
+    return worker;
+}
+
+} // namespace
+
 Scheduler::Scheduler(const Instance& instance)
     : instance{instance}, work_semaphore{instance}, command_pool{instance, &work_semaphore} {
 #if TRACY_GPU_ENABLED
@@ -20,15 +99,27 @@ Scheduler::Scheduler(const Instance& instance)
     BeginSession();
     priority_pending_ops_thread =
         std::jthread(std::bind_front(&Scheduler::PriorityPendingOpsThread, this));
+    GetQueueWorker().Start();
 }
 
 Scheduler::~Scheduler() {
+    GetQueueWorker().Stop();
 #if TRACY_GPU_ENABLED
     std::free(profiler_scope);
 #endif
 }
 
+void Scheduler::FlushQueuedUploads() {
+    if (in_upload_flush || suspend_upload_flush || !on_upload_flush || sessions.empty()) {
+        return;
+    }
+    in_upload_flush = true;
+    on_upload_flush();
+    in_upload_flush = false;
+}
+
 void Scheduler::BeginRendering(const RenderState& new_state) {
+    FlushQueuedUploads();
     if (is_rendering && render_state == new_state) {
         return;
     }
@@ -84,6 +175,7 @@ void Scheduler::BeginRendering(const RenderState& new_state) {
 }
 
 void Scheduler::EndRendering() {
+    FlushQueuedUploads();
     if (!is_rendering) {
         return;
     }
@@ -182,8 +274,40 @@ void Scheduler::EndSession() {
     Check(session.primary.end());
 }
 
+void Scheduler::QueueOperation(Common::UniqueFunction<void()> job, bool wait) {
+    GetQueueWorker().Enqueue(std::move(job), wait);
+}
+
+void Scheduler::ExecuteSubmit(SubmitInfo info, std::vector<vk::CommandBuffer> cmd_buffers) {
+    std::array<vk::PipelineStageFlags, 4> wait_stages;
+    for (u32 index = 0; index < info.num_wait_semas; ++index) {
+        wait_stages[index] = index == 0 ? vk::PipelineStageFlagBits::eAllCommands
+                                        : vk::PipelineStageFlagBits::eColorAttachmentOutput;
+    }
+
+    const vk::TimelineSemaphoreSubmitInfo timeline_si = {
+        .waitSemaphoreValueCount = info.num_wait_semas,
+        .pWaitSemaphoreValues = info.wait_ticks.data(),
+        .signalSemaphoreValueCount = info.num_signal_semas,
+        .pSignalSemaphoreValues = info.signal_ticks.data(),
+    };
+
+    const vk::SubmitInfo submit_info = {
+        .pNext = &timeline_si,
+        .waitSemaphoreCount = info.num_wait_semas,
+        .pWaitSemaphores = info.wait_semas.data(),
+        .pWaitDstStageMask = info.num_wait_semas ? wait_stages.data() : nullptr,
+        .commandBufferCount = static_cast<u32>(cmd_buffers.size()),
+        .pCommandBuffers = cmd_buffers.data(),
+        .signalSemaphoreCount = info.num_signal_semas,
+        .pSignalSemaphores = info.signal_semas.data(),
+    };
+
+    const auto submit_result = instance.GetGraphicsQueue().submit(submit_info, info.fence);
+    ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost, "Device lost during submit");
+}
+
 void Scheduler::SubmitExecution(SubmitInfo& info) {
-    std::scoped_lock lk{submit_mutex};
     const u64 signal_value = work_semaphore.NextTick();
 
 #if TRACY_GPU_ENABLED
@@ -214,32 +338,16 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
     const vk::Semaphore timeline = work_semaphore.Handle();
     info.AddSignal(timeline, signal_value);
 
-    static constexpr std::array<vk::PipelineStageFlags, 2> wait_stage_masks = {
-        vk::PipelineStageFlagBits::eAllCommands,
-        vk::PipelineStageFlagBits::eColorAttachmentOutput,
-    };
-
-    const vk::TimelineSemaphoreSubmitInfo timeline_si = {
-        .waitSemaphoreValueCount = info.num_wait_semas,
-        .pWaitSemaphoreValues = info.wait_ticks.data(),
-        .signalSemaphoreValueCount = info.num_signal_semas,
-        .pSignalSemaphoreValues = info.signal_ticks.data(),
-    };
-
-    const vk::SubmitInfo submit_info = {
-        .pNext = &timeline_si,
-        .waitSemaphoreCount = info.num_wait_semas,
-        .pWaitSemaphores = info.wait_semas.data(),
-        .pWaitDstStageMask = wait_stage_masks.data(),
-        .commandBufferCount = static_cast<u32>(cmd_buffers.size()),
-        .pCommandBuffers = cmd_buffers.data(),
-        .signalSemaphoreCount = info.num_signal_semas,
-        .pSignalSemaphores = info.signal_semas.data(),
-    };
-
-    ImGui::Core::TextureManager::Submit();
-    auto submit_result = instance.GetGraphicsQueue().submit(submit_info, info.fence);
-    ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost, "Device lost during submit");
+    QueueOperation(
+        [this, info, cmd_buffers = std::move(cmd_buffers), pre = std::move(pre_submit)]() mutable {
+            // Runs on the queue thread, after every submit already queued, before this one.
+            ImGui::Core::TextureManager::Submit();
+            if (pre) {
+                pre();
+            }
+            ExecuteSubmit(info, std::move(cmd_buffers));
+        },
+        false);
 
     work_semaphore.Refresh();
     BeginSession();

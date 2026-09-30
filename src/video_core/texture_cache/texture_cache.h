@@ -6,15 +6,18 @@
 #include <condition_variable>
 #include <mutex>
 #include <thread>
+#include <vector>
 #include <unordered_set>
 #include <boost/container/small_vector.hpp>
 #include <queue>
 #include <tsl/robin_map.h>
 
 #include "common/lru_cache.h"
+#include "common/unique_function.h"
 #include "common/multi_level_page_table.h"
 #include "common/slot_vector.h"
 #include "shader_recompiler/resource.h"
+#include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 #include "video_core/texture_cache/blit_helper.h"
 #include "video_core/texture_cache/image.h"
 #include "video_core/texture_cache/image_view.h"
@@ -99,8 +102,24 @@ public:
     /// Evicts any images that overlap the unmapped range.
     void UnmapMemory(VAddr cpu_addr, size_t size);
 
+    struct PendingImageDownload {
+        Vulkan::StagingBufferRef download;
+        VAddr addr{};
+        u32 size{};
+    };
+
     /// Schedules a copy of pending images for download back to CPU memory.
     void ProcessDownloadImages();
+
+    /// Records image readbacks without waiting. The caller submits and applies the result.
+    [[nodiscard]] std::vector<PendingImageDownload> RecordDownloadImages();
+
+    /// Writes a finished image readback into guest memory.
+    void ApplyDownloadImages(std::vector<PendingImageDownload> pending);
+
+    /// Submits recorded image readbacks and runs `after` on the GPU thread once they finish,
+    /// without blocking command processing on the wait.
+    bool DeferDownloads(Common::UniqueFunction<void>& after);
 
     /// Retrieves the image handle of the image with the provided attributes.
     [[nodiscard]] ImageId FindImage(ImageDesc& desc, bool exact_fmt = false);

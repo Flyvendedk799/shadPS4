@@ -84,6 +84,10 @@ public:
     void OnSubmit();
     void OnFence();
 
+    /// When image readbacks are pending, submits them and runs `after` once the GPU finishes.
+    /// Returns false when there is nothing to wait for.
+    bool DeferDownloads(Common::UniqueFunction<void>& after);
+
     PipelineCache& GetPipelineCache() {
         return pipeline_cache;
     }

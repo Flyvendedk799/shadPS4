@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <span>
+#include <vector>
 #include <xxhash.h>
 
 #include "common/assert.h"
@@ -10,6 +12,7 @@
 #include "common/scope_exit.h"
 #include "core/emulator_settings.h"
 #include "core/memory.h"
+#include "video_core/amdgpu/liverpool.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/page_manager.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -63,11 +66,88 @@ TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler&
 TextureCache::~TextureCache() = default;
 
 void TextureCache::ProcessDownloadImages() {
-    std::unique_lock lk{download_images_mutex};
-    for (const ImageId image_id : download_images) {
-        DownloadImageMemory(image_id, true);
+    auto pending = RecordDownloadImages();
+    if (pending.empty()) {
+        return;
     }
-    download_images.clear();
+    scheduler.Finish();
+    ApplyDownloadImages(std::move(pending));
+}
+
+std::vector<TextureCache::PendingImageDownload> TextureCache::RecordDownloadImages() {
+    std::vector<ImageId> images;
+    {
+        std::unique_lock lk{download_images_mutex};
+        images.assign(download_images.begin(), download_images.end());
+        download_images.clear();
+    }
+    std::vector<PendingImageDownload> pending;
+    if (images.empty()) {
+        return pending;
+    }
+    pending.reserve(images.size());
+    scheduler.SuspendUploadFlush();
+    for (const ImageId image_id : images) {
+        Image& image = slot_images[image_id];
+        if (False(image.flags & ImageFlagBits::GpuModified)) {
+            continue;
+        }
+        const u32 download_size = image.info.pitch * image.info.size.height *
+                                  image.info.size.depth * image.info.resources.layers *
+                                  (image.info.num_bits / 8);
+        ASSERT(download_size <= image.info.guest_size);
+        const auto download =
+            runtime.GetStagingPool().Request(download_size, MemoryType::HostCached, 16, true);
+        const vk::BufferImageCopy image_download = {
+            .bufferOffset = download.offset,
+            .bufferRowLength = image.info.pitch,
+            .bufferImageHeight = image.info.size.height,
+            .imageSubresource =
+                {
+                    .aspectMask = image.info.props.is_depth ? vk::ImageAspectFlagBits::eDepth
+                                                            : vk::ImageAspectFlagBits::eColor,
+                    .mipLevel = 0,
+                    .baseArrayLayer = 0,
+                    .layerCount = image.info.resources.layers,
+                },
+            .imageOffset = {0, 0, 0},
+            .imageExtent = {image.info.size.width, image.info.size.height, image.info.size.depth},
+        };
+        runtime.DownloadImage(&image, download.buffer, std::span{&image_download, 1});
+        pending.push_back(PendingImageDownload{
+            .download = download,
+            .addr = image.info.guest_address,
+            .size = download_size,
+        });
+    }
+    scheduler.ResumeUploadFlush();
+    return pending;
+}
+
+void TextureCache::ApplyDownloadImages(std::vector<PendingImageDownload> pending) {
+    for (const PendingImageDownload& ready : pending) {
+        ready.download.Invalidate();
+        Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(ready.addr),
+                                                  ready.download.mapped, ready.size);
+        runtime.GetStagingPool().FreeDeferred(ready.download);
+    }
+}
+
+bool TextureCache::DeferDownloads(Common::UniqueFunction<void>& after) {
+    auto pending = RecordDownloadImages();
+    if (pending.empty()) {
+        return false;
+    }
+    const u64 tick = scheduler.CurrentTick();
+    scheduler.Flush();
+    scheduler.DeferAfter(tick, [this, pending = std::move(pending),
+                                after = std::move(after)]() mutable {
+        liverpool->SendCommand<true>([&] {
+            ApplyDownloadImages(std::move(pending));
+            after();
+        });
+    });
+    return true;
 }
 
 void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
